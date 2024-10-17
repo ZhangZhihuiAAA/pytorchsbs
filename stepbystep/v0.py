@@ -45,6 +45,10 @@ class StepByStep():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.manual_seed(seed)
+        try:
+            self.train_loader.sampler.generator.manual_seed(seed)
+        except AttributeError:
+            pass
 
     def set_loaders(self, train_loader, val_loader=None):
         self.train_loader = train_loader
@@ -131,6 +135,9 @@ class StepByStep():
             # Fetche a single mini-batch so we can use add_graph
             x_sample, y_sample = next(iter(self.train_loader))
             self.writer.add_graph(self.model, x_sample.to(self.device))
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
     def _make_train_step_fn(self):
         # Build function that performs a step in the train loop
