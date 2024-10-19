@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -22,6 +24,8 @@ class StepByStep():
         self.losses = []
         self.val_losses = []
         self.total_epochs = 0
+        self.visualization = {}
+        self.handles = {}
 
         # Create the train_step function for model, loss function and optimizer
         # Note: there are NO ARGS there! It makes use of the class attributes directly
@@ -139,6 +143,153 @@ class StepByStep():
     def count_parameters(self):
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
+    def visualize_filters(self, layer_name, **kwargs):
+        try:
+            # Get the layer object from the model
+            layer = getattr(self.model, layer_name)
+
+            # We are only looking at filters for 2D convolutions
+            if isinstance(layer, nn.Conv2d):
+                weights = layer.weight.data.cpu().numpy()
+                # weights -> (ou_channels (filter), in_channels, filter_H, filter_W)
+                n_filters, n_in_channels, _, _ = weights.shape
+
+                # Build a figure
+                figsize = (2 * n_in_channels + 2, 2 * n_filters)
+                fig, axs = plt.subplots(n_filters, n_in_channels, figsize=figsize, squeeze=False)
+                axs_array = [[axs[i, j] for j in range(n_in_channels)] for i in range(n_filters)]
+
+                # For each filter
+                for i in range(n_filters):
+                    StepByStep._visualize_tensors(
+                        axs_array[i],
+                        weights[i],
+                        layer_name=f'Filter #{i}',
+                        title='Channel'
+                    )
+
+                for ax in axs.flat:
+                    ax.label_outer()
+
+            fig.tight_layout()
+            return
+        except AttributeError:
+            return
+
+    def attach_hooks(self, layers_to_hook, hook_fn=None):
+        # Clear any previous values
+        self.visualization = {}
+
+        # Create the dictionary to map layer objects to their names
+        modules = list(self.model.named_modules())
+        layer_names = {layer: name for name, layer in modules[1:]}
+
+        if hook_fn is None:
+            # Hook function to be attached to the forward pass
+            def hook_fn(layer, inputs, outputs):
+                # Get the layer name
+                name = layer_names[layer]
+                # Detach the outputs
+                values = outputs.detach().cpu().numpy()
+                # Since the hook function may be called multiple times for example, 
+                # if we make predictions for multiple mini-batches it concatenates the results.
+                if self.visualization[name] is None:
+                    self.visualization[name] = values
+                else:
+                    self.visualization[name] = np.concatenate([self.visualization[name], values])
+
+            for name, layer in modules:
+                if name in layers_to_hook:
+                    # Initialize the corresponding key in the dictionary
+                    self.visualization[name] = None
+                    # Register the forward hook and keep the handle in another dict
+                    self.handles[name] = layer.register_forward_hook(hook_fn)
+
+    def remove_hooks(self):
+        for handle in self.handles.values():
+            handle.remove()
+        # Clear the dict, as all hooks have been removed
+        self.handles = {}
+
+    def visualize_outputs(self, layers, n_images=16, y=None, yhat=None):
+        layers = filter(lambda l: l in self.visualization.keys(), layers)
+        layers = list(layers)
+        shapes = [self.visualization[layer].shape for layer in layers]
+        n_rows = [shape[1] if len(shape) == 4 else 1 for shape in shapes]  # number of output channels
+        total_rows = np.sum(n_rows)
+
+        fig, axs = plt.subplots(total_rows, n_images, figsize=(1.5 * n_images, 1.5 * total_rows), squeeze=False)
+        axs_array = [[axs[i, j] for j in range(n_images)] for i in range(total_rows)]
+
+        # Loop through the layers, one layer per row of subplots
+        row = 0
+        for i, layer in enumerate(layers):
+            start_row = row
+            # Take the produced feature maps for that layer
+            output = self.visualization[layer]
+
+            is_vector = len(output.shape) == 2
+
+            for j in range(n_rows[i]):
+                StepByStep._visualize_tensors(
+                    axs_array[row],
+                    output if is_vector else output[:, j].squeeze(),
+                    y,
+                    yhat,
+                    layer_name=layers[i] if is_vector else f'{layers[i]}\nfil#{row - start_row}',
+                    title='Image' if row == 0 else None
+                )
+                row += 1
+
+        for ax in axs.flat:
+            ax.label_outer()
+
+        fig.tight_layout()
+        return fig
+
+    def correct(self, x, y, threshold=.5):
+        self.model.eval()
+        yhat = self.model(x.to(self.device))
+        y = y.to(self.device)
+        self.model.train()
+        
+        # We get the size of the batch and the number of classes (only 1, if it is binary)
+        n_samples, n_dims = yhat.shape
+        if n_dims > 1:        
+            # In a multiclass classification, the biggest logit always wins, so we don't bother getting probabilities
+            
+            # This is PyTorch's version of argmax, but it returns a tuple: (max value, index of max value)
+            _, predicted = torch.max(yhat, 1)
+        else:
+            n_dims += 1
+            # In binary classification, we NEED to check if the last layer is a sigmoid (and then it produces probs)
+            if isinstance(self.model, nn.Sequential) and isinstance(self.model[-1], nn.Sigmoid):
+                predicted = (yhat > threshold).long()
+            # or something else (logits), which we need to convert using a sigmoid
+            else:
+                predicted = (F.sigmoid(yhat) > threshold).long()
+        
+        # How many samples got classified correctly for each class
+        result = []
+        for c in range(n_dims):
+            n_class = (y == c).sum().item()
+            n_correct = (predicted[y == c] == c).sum().item()
+            result.append((n_correct, n_class))
+
+        return torch.tensor(result)
+
+    @staticmethod
+    def loader_apply(loader, func, reduce='sum'):
+        results = [func(x, y) for i, (x, y) in enumerate(loader)]
+        results = torch.stack(results, axis=0)
+
+        if reduce == 'sum':
+            results = results.sum(axis=0)
+        elif reduce == 'mean':
+            results = results.float().mean(axis=0)
+        
+        return results
+
     def _make_train_step_fn(self):
         # Build function that performs a step in the train loop
         def perform_train_step_fn(x, y):
@@ -187,3 +338,29 @@ class StepByStep():
 
         loss = np.mean(mini_batch_losses)
         return loss
+
+    @staticmethod
+    def _visualize_tensors(axs, x, y=None, yhat=None, layer_name='', title=None):
+        n_images = len(axs)
+        # Gets max and min values for scaling the grayscale
+        minv, maxv = np.min(x[:n_images]), np.max(x[:n_images])
+
+        for i, img in enumerate(x[:n_images]):
+            ax = axs[i]
+            # Set title, labels, and remove ticks
+            if title is not None:
+                ax.set_title(f'{title} #{i}', fontsize=12)
+            shp = np.atleast_2d(img).shape
+            ax.set_ylabel(f'{layer_name}\n{shp[0]}x{shp[1]}', rotation=0, fontsize=12, labelpad=20)
+            xlabel1 = '' if y is None else f'\nLabel: {y[i]}'
+            xlabel2 = '' if yhat is None else f'\nPredicted: {yhat[i]}'
+            xlabel = f'{xlabel1}{xlabel2}'
+            if len(xlabel):
+                ax.set_xlabel(xlabel, fontsize=12)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            # Plot weight as an image
+            ax.imshow(np.atleast_2d(img.squeeze()), cmap='gray', vmin=minv, vmax=maxv)
+
+        return
