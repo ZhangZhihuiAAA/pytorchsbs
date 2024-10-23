@@ -1,3 +1,5 @@
+import numpy as np
+
 
 true_b = 1
 true_w = 2

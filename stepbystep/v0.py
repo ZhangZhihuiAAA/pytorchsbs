@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.transforms.v2 import Normalize
+
+plt.style.use('fivethirtyeight')
 
 
 class StepByStep():
@@ -128,8 +131,7 @@ class StepByStep():
         plt.ylabel('Loss')
         plt.yscale('log')
         plt.plot(self.losses, label='Training Loss', c='b')
-        if self.val_losses:
-            plt.plot(self.val_losses, label='Validation Loss', c='r')
+        plt.plot(self.val_losses, label='Validation Loss', c='r')
         plt.legend()
         fig.tight_layout()
         return fig
@@ -155,7 +157,7 @@ class StepByStep():
                 n_filters, n_in_channels, _, _ = weights.shape
 
                 # Build a figure
-                figsize = (2 * n_in_channels + 2, 2 * n_filters)
+                figsize = (1.5 * n_in_channels + 1, 1.5 * n_filters)
                 fig, axs = plt.subplots(n_filters, n_in_channels, figsize=figsize, squeeze=False)
                 axs_array = [[axs[i, j] for j in range(n_in_channels)] for i in range(n_filters)]
 
@@ -164,8 +166,8 @@ class StepByStep():
                     StepByStep._visualize_tensors(
                         axs_array[i],
                         weights[i],
-                        layer_name=f'Filter #{i}',
-                        title='Channel'
+                        layer_name=f'Fil #{i}',
+                        title='Chan'
                     )
 
                 for ax in axs.flat:
@@ -198,12 +200,12 @@ class StepByStep():
                 else:
                     self.visualization[name] = np.concatenate([self.visualization[name], values])
 
-            for name, layer in modules:
-                if name in layers_to_hook:
-                    # Initialize the corresponding key in the dictionary
-                    self.visualization[name] = None
-                    # Register the forward hook and keep the handle in another dict
-                    self.handles[name] = layer.register_forward_hook(hook_fn)
+        for name, layer in modules:
+            if name in layers_to_hook:
+                # Initialize the corresponding key in the dictionary
+                self.visualization[name] = None
+                # Register the forward hook and keep the handle in another dict
+                self.handles[name] = layer.register_forward_hook(hook_fn)
 
     def remove_hooks(self):
         for handle in self.handles.values():
@@ -278,6 +280,7 @@ class StepByStep():
 
         return torch.tensor(result)
 
+
     @staticmethod
     def loader_apply(loader, func, reduce='sum'):
         results = [func(x, y) for i, (x, y) in enumerate(loader)]
@@ -289,6 +292,42 @@ class StepByStep():
             results = results.float().mean(axis=0)
         
         return results
+
+    @staticmethod
+    def statistics_per_channel(images, labels):
+        # NCHW
+        n_samples, n_channels, n_height, n_weight = images.size()
+        # Flatten HW to a single dimension
+        flatten_per_channel = images.reshape(n_samples, n_channels, -1)
+
+        # Compute statistics of each image per channel
+        # Average pixel value per channel 
+        # (n_samples, n_channels)
+        means = flatten_per_channel.mean(axis=2)
+        # Standard deviation of pixel values per channel
+        # (n_samples, n_channels)
+        stds = flatten_per_channel.std(axis=2)
+
+        # Add up statistics of all images in a mini-batch
+        # (1, n_channels)
+        sum_means = means.sum(axis=0)
+        sum_stds = stds.sum(axis=0)
+
+        # Make a tensor of shape (1, n_channels) with the number of samples in the mini-batch
+        # [16] * 3 = [16, 16, 16]
+        n_samples = torch.tensor([n_samples] * n_channels).float()
+
+        # Stack the three tensors on top of one another
+        # (3, n_channels)
+        return torch.stack([n_samples, sum_means, sum_stds], axis=0)
+
+    @staticmethod
+    def make_normalizer(loader):
+        total_samples, total_means, total_stds = StepByStep.loader_apply(loader, StepByStep.statistics_per_channel)
+        norm_mean = total_means / total_samples
+        norm_std = total_stds / total_samples
+        return Normalize(mean=norm_mean, std=norm_std)
+
 
     def _make_train_step_fn(self):
         # Build function that performs a step in the train loop
@@ -351,12 +390,12 @@ class StepByStep():
             if title is not None:
                 ax.set_title(f'{title} #{i}', fontsize=12)
             shp = np.atleast_2d(img).shape
-            ax.set_ylabel(f'{layer_name}\n{shp[0]}x{shp[1]}', rotation=0, fontsize=12, labelpad=20)
+            ax.set_ylabel(f'{layer_name}\n{shp[0]}x{shp[1]}', rotation=0, fontsize=10, labelpad=20)
             xlabel1 = '' if y is None else f'\nLabel: {y[i]}'
             xlabel2 = '' if yhat is None else f'\nPredicted: {yhat[i]}'
             xlabel = f'{xlabel1}{xlabel2}'
             if len(xlabel):
-                ax.set_xlabel(xlabel, fontsize=12)
+                ax.set_xlabel(xlabel, fontsize=10)
             ax.set_xticks([])
             ax.set_yticks([])
 
