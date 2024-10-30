@@ -39,6 +39,7 @@ class StepByStep():
         self.writer = None
         self.scheduler = None
         self.is_batch_lr_scheduler = False
+        self.clipping = None
 
         # These attributes are going to be computed internally
         self.losses = []
@@ -97,6 +98,28 @@ class StepByStep():
                 isinstance(scheduler, OneCycleLR) or 
                 isinstance(scheduler, CosineAnnealingWarmRestarts)):
                 self.is_batch_lr_scheduler = True
+
+    def set_clip_grad_value(self, clip_value):
+        self.clipping = lambda: nn.utils.clip_grad_value_(self.model.parameters(), clip_value=clip_value)
+
+    def set_clip_grad_norm(self, max_norm, norm_type=2):
+        self.clipping = lambda: nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_norm, norm_type=norm_type)
+
+    def set_clip_backprop(self, clip_value):
+        if self.clipping is None:
+            self.clipping = []
+
+        for p in self.model.parameters():
+            if p.requires_grad:
+                func = lambda grad: torch.clamp(grad, -clip_value, clip_value)
+                handle = p.register_hook(func)
+                self.clipping.append(handle)
+
+    def remove_clip(self):
+        if isinstance(self.clipping, list):
+            for handle in self.clipping:
+                handle.remove()
+        self.clipping = None
 
     def train(self, n_epochs, seed=42):
         self.set_seed(seed)
@@ -516,6 +539,10 @@ class StepByStep():
             yhat = self.model(x)
             loss = self.loss_fn(yhat, y)
             loss.backward()
+
+            if callable(self.clipping):
+                self.clipping()
+
             self.optimizer.step()
             self.optimizer.zero_grad()
 
